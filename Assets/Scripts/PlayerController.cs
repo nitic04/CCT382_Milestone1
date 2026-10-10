@@ -1,6 +1,6 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
-using Cinemachine; // if this shows an error, use: using Unity.Cinemachine;
+using Cinemachine;
 
 [RequireComponent(typeof(CharacterController))]
 public class PlayerController : MonoBehaviour
@@ -15,8 +15,6 @@ public class PlayerController : MonoBehaviour
     public float jumpHeight = 1.2f;
     public float gravity = -25f;
     public float fallMultiplier = 1.5f;
-    public float coyoteTime = 0.1f;
-    public float jumpBuffer = 0.1f;
 
     [Header("Slide")]
     public float slideStartSpeed = 6f;
@@ -45,29 +43,28 @@ public class PlayerController : MonoBehaviour
 
     [Header("Audio")]
     public AudioSource audioSource;
-    public AudioSource footstepSource;
-    public AudioClip[] footstepClips;
-    public AudioClip jumpClip;
     public AudioClip softLandClip;
     public AudioClip hardLandClip;
     public AudioClip slideClip;
+    [Range(0f, 1f)] public float slideVolume = 0.5f;
+
+    [Header("Footsteps")]
+    public AudioClip footstepClip;
     public float walkStepDistance = 0.8f;
     public float runStepDistance = 1.6f;
+    public float footstepMaxLength = 0.25f;
     [Range(0f, 1f)] public float footstepVolume = 0.6f;
-    public float footstepMaxLength = 0.3f;
-    [Range(0f, 1f)] public float slideVolume = 0.5f;
 
     CharacterController controller;
     Animator animator;
     Transform cam;
     CinemachineImpulseSource impulse;
+    AudioSource footstepSource;
 
     Vector2 moveInput;
     bool sprinting;
     Vector3 velocity;
     float verticalVelocity;
-    float coyoteTimer;
-    float jumpBufferTimer;
 
     bool sliding;
     float slideTimer;
@@ -76,13 +73,10 @@ public class PlayerController : MonoBehaviour
 
     bool wasGrounded;
     float peakY;
-    float recoveryTimer;
-
+    float recoverUntil;
     float stepAccum;
-    int lastStepIndex = -1;
-    float footstepStartTime;
-    float footstepBaseVolume;
-    const float FootstepFade = 0.08f;
+
+    bool Recovering => Time.time < recoverUntil;
 
     void Awake()
     {
@@ -91,28 +85,82 @@ public class PlayerController : MonoBehaviour
         impulse = GetComponent<CinemachineImpulseSource>();
         cam = Camera.main.transform;
         Cursor.lockState = CursorLockMode.Locked;
+
+        // separate source so each step can be cut short
+        footstepSource = gameObject.AddComponent<AudioSource>();
+        footstepSource.playOnAwake = false;
+        footstepSource.clip = footstepClip;
+        footstepSource.volume = footstepVolume;
     }
 
-    public void OnMove(InputValue value)
-    {
-        moveInput = value.Get<Vector2>();
-    }
-
-    public void OnSprint(InputValue value)
-    {
-        sprinting = value.isPressed;
-    }
+    public void OnMove(InputValue value) { moveInput = value.Get<Vector2>(); }
+    public void OnSprint(InputValue value) { sprinting = value.isPressed; }
 
     public void OnJump(InputValue value)
     {
-        if (value.isPressed) jumpBufferTimer = jumpBuffer;
+        if (!value.isPressed || sliding || !controller.isGrounded || Recovering) return;
+        animator.SetTrigger("Jump");
+        verticalVelocity = Mathf.Sqrt(jumpHeight * -2f * gravity);
     }
 
     public void OnSlide(InputValue value)
     {
-        if (!value.isPressed || sliding || !controller.isGrounded || recoveryTimer > 0f) return;
+        if (!value.isPressed || sliding || !controller.isGrounded || Recovering) return;
         if (velocity.magnitude < 1f) return;
         StartSlide();
+    }
+
+    void Update()
+    {
+        if (sliding) UpdateSlide();
+        else UpdateWalking();
+
+        if (controller.isGrounded && verticalVelocity < 0f) verticalVelocity = -2f;
+        verticalVelocity += gravity * (verticalVelocity < 0f ? fallMultiplier : 1f) * Time.deltaTime;
+
+        controller.Move((velocity + Vector3.up * verticalVelocity) * Time.deltaTime);
+
+        bool grounded = controller.isGrounded;
+        animator.SetBool("Grounded", grounded);
+
+        float y = transform.position.y;
+        if (grounded && !wasGrounded) OnLand(peakY - y);
+        peakY = grounded ? y : Mathf.Max(peakY, y);
+        wasGrounded = grounded;
+
+        float speed = new Vector3(controller.velocity.x, 0f, controller.velocity.z).magnitude;
+        HandleFootsteps(grounded, speed);
+
+        var emission = dust.emission;
+        emission.rateOverTime = grounded && !sliding && speed > runSpeed * 0.7f ? runDustRate : 0f;
+
+        if (!sliding && velocity.magnitude > 0.1f)
+            transform.rotation = Quaternion.RotateTowards(transform.rotation, Quaternion.LookRotation(velocity), turnSpeed * Time.deltaTime);
+
+        animator.SetFloat("Speed", velocity.magnitude / runSpeed, 0.1f, Time.deltaTime);
+    }
+
+    void UpdateWalking()
+    {
+        Vector3 forward = cam.forward; forward.y = 0; forward.Normalize();
+        Vector3 right = cam.right; right.y = 0; right.Normalize();
+        Vector3 direction = forward * moveInput.y + right * moveInput.x;
+
+        float maxSpeed = sprinting ? runSpeed : walkSpeed;
+        if (Recovering) maxSpeed *= landRecoverySpeed;
+
+        Vector3 target = direction.normalized * (Mathf.Clamp01(moveInput.magnitude) * maxSpeed);
+        velocity = Vector3.MoveTowards(velocity, target, acceleration * Time.deltaTime);
+    }
+
+    void UpdateSlide()
+    {
+        slideTimer -= Time.deltaTime;
+        float t = Mathf.Clamp01(slideTimer / slideDuration);
+        EmitSlideDust(t);
+        velocity = slideDirection * Mathf.Lerp(slideEndSpeed, slideStartSpeed, t);
+
+        if (slideTimer <= 0f && !HeadBlocked()) EndSlide();
     }
 
     void StartSlide()
@@ -120,20 +168,22 @@ public class PlayerController : MonoBehaviour
         sliding = true;
         slideTimer = slideDuration;
         slideDirection = velocity.normalized;
-        slideDustAccum = 0f;
-        controller.height = slideHeight;
-        controller.center = new Vector3(0f, slideHeight / 2f, 0f);
+        SetCapsule(slideHeight);
         animator.SetBool("Sliding", true);
-        if (footstepSource != null) footstepSource.Stop();
-        PlaySound(slideClip, slideVolume, 0.03f);
+        PlaySound(slideClip, slideVolume);
     }
 
     void EndSlide()
     {
         sliding = false;
-        controller.height = standHeight;
-        controller.center = new Vector3(0f, standHeight / 2f, 0f);
+        SetCapsule(standHeight);
         animator.SetBool("Sliding", false);
+    }
+
+    void SetCapsule(float height)
+    {
+        controller.height = height;
+        controller.center = new Vector3(0f, height / 2f, 0f);
     }
 
     bool HeadBlocked()
@@ -142,174 +192,62 @@ public class PlayerController : MonoBehaviour
         return Physics.Raycast(origin, Vector3.up, standHeight - slideHeight + 0.1f, ~0, QueryTriggerInteraction.Ignore);
     }
 
-    void PlaySound(AudioClip clip, float volume = 1f, float pitchVariance = 0.05f)
+    void OnLand(float fall)
     {
-        if (audioSource == null || clip == null) return;
-        audioSource.pitch = 1f + Random.Range(-pitchVariance, pitchVariance);
-        audioSource.PlayOneShot(clip, volume);
-    }
+        if (fall > shakeFallThreshold)
+            impulse.GenerateImpulse(Vector3.down * Mathf.Clamp01((fall - shakeFallThreshold) / 2f + 0.2f));
 
-    void PlayFootstep(AudioClip clip, float volume)
-    {
-        if (footstepSource == null || clip == null) return;
-        footstepSource.Stop();
-        footstepSource.clip = clip;
-        footstepSource.pitch = 1f + Random.Range(-0.06f, 0.06f);
-        footstepBaseVolume = volume;
-        footstepSource.volume = volume;
-        footstepStartTime = Time.time;
-        footstepSource.Play();
-    }
-
-    void UpdateFootstepFade()
-    {
-        if (footstepSource == null || !footstepSource.isPlaying) return;
-        float age = Time.time - footstepStartTime;
-        float fadeStart = footstepMaxLength - FootstepFade;
-        if (age >= footstepMaxLength) footstepSource.Stop();
-        else if (age > fadeStart) footstepSource.volume = footstepBaseVolume * (1f - (age - fadeStart) / FootstepFade);
-    }
-
-    void HandleFootsteps(bool isGrounded, float planarSpeed)
-    {
-        if (!isGrounded || sliding || planarSpeed < 0.5f)
+        if (fall > hardLandThreshold)
         {
-            stepAccum = walkStepDistance * 0.5f;
-            return;
+            recoverUntil = Time.time + landRecoveryTime;
+            animator.SetTrigger("HardLand");
+            PlaySound(hardLandClip);
+            dust.Emit(hardLandDustCount);
         }
-        if (footstepClips == null || footstepClips.Length == 0) return;
-
-        float threshold = Mathf.Lerp(walkStepDistance, runStepDistance, Mathf.InverseLerp(walkSpeed, runSpeed, planarSpeed));
-        stepAccum += planarSpeed * Time.deltaTime;
-        if (stepAccum < threshold) return;
-        stepAccum -= threshold;
-
-        int index = Random.Range(0, footstepClips.Length);
-        if (footstepClips.Length > 1 && index == lastStepIndex) index = (index + 1) % footstepClips.Length;
-        lastStepIndex = index;
-        PlayFootstep(footstepClips[index], footstepVolume * Random.Range(0.85f, 1f));
+        else if (fall > softLandFall)
+        {
+            PlaySound(softLandClip, Mathf.Clamp(0.5f + fall * 0.2f, 0.5f, 1f));
+            dust.Emit(softLandDustCount);
+        }
     }
 
+    // more and bigger puffs while the slide is fast
     void EmitSlideDust(float speed01)
     {
-        if (dust == null) return;
         slideDustAccum += Mathf.Lerp(slideDustMin, slideDustMax, speed01) * Time.deltaTime;
-        int count = (int)slideDustAccum;
-        slideDustAccum -= count;
 
         var p = new ParticleSystem.EmitParams();
-        for (int i = 0; i < count; i++)
+        for (; slideDustAccum >= 1f; slideDustAccum -= 1f)
         {
-            float size = slideDustSize * Mathf.Lerp(1.3f, 0.6f, speed01) * Random.Range(0.7f, 1f);
-            p.startSize = size;
-            p.startLifetime = Random.Range(0.6f, 1.0f);
+            p.startSize = slideDustSize * Mathf.Lerp(1.3f, 0.6f, speed01) * Random.Range(0.7f, 1f);
+            p.startLifetime = Random.Range(0.6f, 1f);
             p.position = transform.position + Vector3.up * 0.05f + Random.insideUnitSphere * 0.25f;
             p.velocity = -slideDirection * Mathf.Lerp(0.3f, 2.5f, speed01) + Random.insideUnitSphere * 0.3f + Vector3.up * 0.15f;
             dust.Emit(p, 1);
         }
     }
 
-    void Update()
+    void PlaySound(AudioClip clip, float volume = 1f)
     {
-        bool grounded = controller.isGrounded;
-        recoveryTimer -= Time.deltaTime;
+        audioSource.pitch = Random.Range(0.95f, 1.05f);
+        audioSource.PlayOneShot(clip, volume);
+    }
 
-        if (sliding)
+    void HandleFootsteps(bool grounded, float speed)
+    {
+        if (!grounded || sliding || speed < 0.5f)
         {
-            slideTimer -= Time.deltaTime;
-            float t = Mathf.Clamp01(slideTimer / slideDuration);
-            EmitSlideDust(t);
-            float slideSpeed = Mathf.Lerp(slideEndSpeed, slideStartSpeed, t);
-            velocity = slideDirection * slideSpeed;
-            if (slideTimer <= 0f && !HeadBlocked()) EndSlide();
-        }
-        else
-        {
-            Vector3 forward = cam.forward; forward.y = 0; forward.Normalize();
-            Vector3 right = cam.right; right.y = 0; right.Normalize();
-            Vector3 direction = forward * moveInput.y + right * moveInput.x;
-
-            float maxSpeed = sprinting ? runSpeed : walkSpeed;
-            if (recoveryTimer > 0f) maxSpeed *= landRecoverySpeed;
-            float magnitude = Mathf.Clamp01(moveInput.magnitude);
-            Vector3 targetVelocity = direction.normalized * (magnitude * maxSpeed);
-            velocity = Vector3.MoveTowards(velocity, targetVelocity, acceleration * Time.deltaTime);
+            stepAccum = walkStepDistance * 0.5f;
+            return;
         }
 
-        if (grounded) coyoteTimer = coyoteTime;
-        else coyoteTimer -= Time.deltaTime;
-        jumpBufferTimer -= Time.deltaTime;
+        float stride = sprinting ? runStepDistance : walkStepDistance;
+        stepAccum += speed * Time.deltaTime;
+        if (stepAccum < stride) return;
+        stepAccum -= stride;
 
-        if (grounded && verticalVelocity < 0f) verticalVelocity = -2f;
-
-        if (!sliding && recoveryTimer <= 0f && jumpBufferTimer > 0f && coyoteTimer > 0f)
-        {
-            animator.SetTrigger("Jump");
-            PlaySound(jumpClip, 0.8f);
-            verticalVelocity = Mathf.Sqrt(jumpHeight * -2f * gravity);
-            jumpBufferTimer = 0f;
-            coyoteTimer = 0f;
-        }
-
-        float g = gravity * (verticalVelocity < 0f ? fallMultiplier : 1f);
-        verticalVelocity += g * Time.deltaTime;
-
-        Vector3 move = velocity + Vector3.up * verticalVelocity;
-        controller.Move(move * Time.deltaTime);
-
-        bool nowGrounded = controller.isGrounded;
-        animator.SetBool("Grounded", nowGrounded);
-
-        float y = transform.position.y;
-        if (!nowGrounded)
-        {
-            peakY = Mathf.Max(peakY, y);
-        }
-        else
-        {
-            if (!wasGrounded)
-            {
-                float fall = peakY - y;
-                if (fall > shakeFallThreshold)
-                    impulse.GenerateImpulse(Vector3.down * Mathf.Clamp01((fall - shakeFallThreshold) / 2f + 0.2f));
-                if (fall > hardLandThreshold)
-                {
-                    recoveryTimer = landRecoveryTime;
-                    animator.SetTrigger("HardLand");
-                    PlaySound(hardLandClip, 1f, 0.03f);
-                }
-                else if (fall > softLandFall)
-                {
-                    PlaySound(softLandClip, Mathf.Clamp(0.5f + fall * 0.2f, 0.5f, 1f), 0.05f);
-                }
-
-                if (dust != null)
-                {
-                    int burst = fall > hardLandThreshold ? hardLandDustCount : (fall > softLandFall ? softLandDustCount : 0);
-                    if (burst > 0) dust.Emit(burst);
-                }
-            }
-            peakY = y;
-        }
-        wasGrounded = nowGrounded;
-
-        float planarSpeed = new Vector3(controller.velocity.x, 0f, controller.velocity.z).magnitude;
-        HandleFootsteps(nowGrounded, planarSpeed);
-        UpdateFootstepFade();
-
-        if (dust != null)
-        {
-            bool kickUpDust = nowGrounded && !sliding && planarSpeed > runSpeed * 0.7f;
-            var emission = dust.emission;
-            emission.rateOverTime = kickUpDust ? runDustRate : 0f;
-        }
-
-        if (!sliding && velocity.magnitude > 0.1f)
-        {
-            Quaternion targetRotation = Quaternion.LookRotation(velocity);
-            transform.rotation = Quaternion.RotateTowards(transform.rotation, targetRotation, turnSpeed * Time.deltaTime);
-        }
-
-        animator.SetFloat("Speed", velocity.magnitude / runSpeed, 0.1f, Time.deltaTime);
+        footstepSource.pitch = Random.Range(0.92f, 1.08f);
+        footstepSource.PlayScheduled(AudioSettings.dspTime);
+        footstepSource.SetScheduledEndTime(AudioSettings.dspTime + footstepMaxLength);
     }
 }

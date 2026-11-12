@@ -110,6 +110,13 @@ public class PlayerController : MonoBehaviour
         StartSlide();
     }
 
+    public void ResetMotion()
+    {
+        velocity = Vector3.zero;
+        verticalVelocity = 0f;
+        peakY = transform.position.y;
+    }
+
     void Update()
     {
         if (sliding) UpdateSlide();
